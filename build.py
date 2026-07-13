@@ -11,7 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 try:
-    from dateutil.rrule import rruleset, rrulestr
+    from dateutil.rrule import rruleset, rrulestr  # type: ignore
 except Exception:  # pragma: no cover
     rruleset = None
     rrulestr = None
@@ -44,6 +44,7 @@ class RawEvent:
     all_day: bool = False
     location: str = ""
     url: str = ""
+    description: str = ""
     rrule: str = ""
     rdates: list[datetime] = field(default_factory=list)
     exdates: list[datetime] = field(default_factory=list)
@@ -58,6 +59,7 @@ class Event:
     all_day: bool = False
     location: str = ""
     url: str = ""
+    description: str = ""
 
 
 def fetch_ics(url: str) -> str:
@@ -96,6 +98,16 @@ def parse_line(line: str):
                 k, v = chunk.split("=", 1)
                 params[k.upper()] = v
     return name, params, value
+
+
+def decode_ical_text(value: str) -> str:
+    return (
+        value.replace("\\\\", "\\")
+        .replace("\\n", "\n")
+        .replace("\\N", "\n")
+        .replace("\\,", ",")
+        .replace("\\;", ";")
+    )
 
 
 def parse_ics_datetime(value: str, params: dict[str, str]) -> tuple[datetime, bool]:
@@ -272,13 +284,15 @@ def parse_events(ics_text: str) -> list[RawEvent]:
         name, params, value = parsed
 
         if name == "UID":
-            current["uid"] = value
+            current["uid"] = decode_ical_text(value)
         elif name == "SUMMARY":
-            current["summary"] = value
+            current["summary"] = decode_ical_text(value)
         elif name == "LOCATION":
-            current["location"] = value
+            current["location"] = decode_ical_text(value)
         elif name == "URL":
-            current["url"] = value
+            current["url"] = decode_ical_text(value)
+        elif name == "DESCRIPTION":
+            current["description"] = decode_ical_text(value)
         elif name == "RRULE":
             current["rrule"] = value
         elif name == "RECURRENCE-ID":
@@ -310,6 +324,7 @@ def parse_events(ics_text: str) -> list[RawEvent]:
                 all_day=bool(e.get("all_day", False)),
                 location=str(e.get("location", "")),
                 url=str(e.get("url", "")),
+                description=str(e.get("description", "")),
                 rrule=str(e.get("rrule", "")),
                 rdates=list(e.get("rdates", [])),
                 exdates=list(e.get("exdates", [])),
@@ -320,7 +335,7 @@ def parse_events(ics_text: str) -> list[RawEvent]:
 
 
 def expand_starts_with_dateutil(master: RawEvent, window_end: datetime) -> list[datetime]:
-    if rrulestr is None:
+    if rrulestr is None or rruleset is None:
         return []
 
     try:
@@ -342,7 +357,9 @@ def expand_starts_with_dateutil(master: RawEvent, window_end: datetime) -> list[
 def expand_starts_fallback(master: RawEvent, window_end: datetime) -> list[datetime]:
     if not master.rrule:
         starts = [master.start] + master.rdates
-        return sorted(set(dt for dt in starts if dt < window_end))
+        exset = {d.isoformat() for d in master.exdates}
+        unique = sorted({dt for dt in starts if dt < window_end and dt.isoformat() not in exset})
+        return unique
 
     rule = parse_rrule(master.rrule)
     freq = rule.get("FREQ", "").upper()
@@ -541,6 +558,7 @@ def expand_events(events: list[RawEvent]) -> list[Event]:
                     all_day=all_day,
                     location=source.location,
                     url=source.url,
+                    description=source.description,
                 )
             )
 
@@ -587,6 +605,7 @@ def to_json(events: list[Event]) -> list[dict]:
             "all_day": e.all_day,
             "location": e.location,
             "url": e.url,
+            "description": e.description,
         }
         for e in events
     ]
@@ -638,6 +657,41 @@ def widget_js() -> str:
     return `${formatTime(event.start)} - ${formatTime(event.end)}`;
   }
 
+  function linkifyText(text) {
+    const urlRegex = /(https?:\/\/[^\s<]+)/g;
+    return esc(text).replace(urlRegex, (url) => `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>`);
+  }
+
+  function descriptionToHtml(description) {
+    if (!description) return "";
+    const normalized = String(description).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+    if (!normalized) return "";
+    const paragraphs = normalized.split(/\n{2,}/);
+    return paragraphs
+      .map((para) => {
+        const lines = para.split("\n").map((line) => linkifyText(line));
+        return `<p>${lines.join("<br>")}</p>`;
+      })
+      .join("");
+  }
+
+  function groupByDay(events) {
+    const groups = [];
+    let currentKey = null;
+    let currentGroup = null;
+
+    for (const event of events) {
+      const key = event.start ? event.start.slice(0, 10) : "unknown";
+      if (key !== currentKey) {
+        currentKey = key;
+        currentGroup = { key, events: [] };
+        groups.push(currentGroup);
+      }
+      currentGroup.events.push(event);
+    }
+    return groups;
+  }
+
   function render(target, events) {
     const root = typeof target === "string" ? document.querySelector(target) : target;
     if (!root) return;
@@ -649,41 +703,67 @@ def widget_js() -> str:
           <div class="calendar-widget__kicker">Calendar</div>
           <h3 class="calendar-widget__title">Upcoming events</h3>
         </div>
-        <div class="calendar-widget__status" data-calendar-status>Loading…</div>
       </div>
       <div class="calendar-widget__list" data-calendar-list aria-live="polite"></div>
     `;
 
-    const statusEl = root.querySelector("[data-calendar-status]");
     const listEl = root.querySelector("[data-calendar-list]");
 
     if (!events.length) {
       listEl.innerHTML = `<div class="calendar-widget__empty">No upcoming events at the moment.</div>`;
-      statusEl.textContent = "Up to date";
       return;
     }
 
-    listEl.innerHTML = events.map((event) => {
-      const dateLabel = event.start ? formatDate(event.start) : "";
-      const timeLabel = formatRange(event);
-      const title = event.summary || "Untitled event";
-      const location = event.location ? `<div class="calendar-widget__location">${esc(event.location)}</div>` : "";
-      const titleHtml = event.url
-        ? `<a href="${esc(event.url)}" target="_blank" rel="noopener noreferrer">${esc(title)}</a>`
-        : esc(title);
+    const groups = groupByDay(events);
+
+    listEl.innerHTML = groups.map((group) => {
+      const dayDate = new Date(group.events[0].start);
+      const dayLabel = new Intl.DateTimeFormat("en-GB", {
+        weekday: "long",
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        timeZone: SITE_TZ
+      }).format(dayDate);
+
+      const items = group.events.map((event, idx) => {
+        const dateLabel = event.start ? formatDate(event.start) : "";
+        const timeLabel = formatRange(event);
+        const title = event.summary || "Untitled event";
+        const location = event.location ? `<div class="calendar-widget__location">${esc(event.location)}</div>` : "";
+        const descriptionHtml = descriptionToHtml(event.description || "");
+        const descriptionBlock = descriptionHtml
+          ? `<div class="calendar-widget__description">${descriptionHtml}</div>`
+          : `<div class="calendar-widget__description calendar-widget__description--empty"></div>`;
+        const descId = `calendar-desc-${group.key.replace(/[^a-zA-Z0-9_-]/g, "")}-${idx}`;
+
+        return `
+          <article class="calendar-widget__item">
+            <div class="calendar-widget__meta">
+              <span class="calendar-widget__date">${esc(dateLabel)}</span>
+              <span class="calendar-widget__time">${esc(timeLabel)}</span>
+            </div>
+            <details class="calendar-widget__details">
+              <summary class="calendar-widget__summary" aria-controls="${descId}">
+                <span class="calendar-widget__summary-title">${esc(title)}</span>
+                <span class="calendar-widget__chevron" aria-hidden="true">&gt;</span>
+              </summary>
+              ${location}
+              <div id="${descId}">
+                ${descriptionBlock}
+              </div>
+            </details>
+          </article>
+        `;
+      }).join("");
 
       return `
-        <article class="calendar-widget__item">
-          <div class="calendar-widget__meta">
-            <span class="calendar-widget__date">${esc(dateLabel)}</span>
-            <span class="calendar-widget__time">${esc(timeLabel)}</span>
-          </div>
-          <div class="calendar-widget__name">${titleHtml}${location}</div>
-        </article>
+        <section class="calendar-widget__day-group">
+          <div class="calendar-widget__day-heading">${esc(dayLabel)}</div>
+          ${items}
+        </section>
       `;
     }).join("");
-
-    statusEl.textContent = `${events.length} event${events.length === 1 ? "" : "s"}`;
   }
 
   function ensureStyles() {
@@ -691,6 +771,8 @@ def widget_js() -> str:
     const style = document.createElement("style");
     style.id = "calendar-widget-styles";
     style.textContent = `
+      @import url('https://fonts.googleapis.com/css2?family=Quattrocento:wght@400;700&family=Quattrocento+Sans:wght@400;700&display=swap');
+
       .calendar-widget {
         --ink: #111;
         --muted: rgba(17, 17, 17, 0.68);
@@ -698,7 +780,6 @@ def widget_js() -> str:
         --soft: rgba(17, 17, 17, 0.04);
         max-width: 760px;
         margin: 0 auto;
-        font-family: Georgia, "Times New Roman", serif;
         color: var(--ink);
       }
       .calendar-widget__head {
@@ -714,23 +795,31 @@ def widget_js() -> str:
         font-size: 0.72rem;
         color: var(--muted);
         margin-bottom: 6px;
+        font-family: "Quattrocento Sans", system-ui, sans-serif;
       }
       .calendar-widget__title {
         margin: 0;
         font-size: 1.5rem;
         line-height: 1.15;
-        font-weight: 500;
-      }
-      .calendar-widget__status {
-        font-size: 0.86rem;
-        color: var(--muted);
-        white-space: nowrap;
+        font-weight: 400;
+        font-family: "Quattrocento", Georgia, serif;
       }
       .calendar-widget__list {
         max-height: 420px;
         overflow-y: auto;
         border-top: 1px solid var(--line);
         border-bottom: 1px solid var(--line);
+      }
+      .calendar-widget__day-group + .calendar-widget__day-group {
+        border-top: 1px solid var(--line);
+      }
+      .calendar-widget__day-heading {
+        padding: 0.9rem 0 0.55rem;
+        font-family: "Quattrocento", Georgia, serif;
+        font-size: 0.92rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
       }
       .calendar-widget__item {
         display: grid;
@@ -739,43 +828,89 @@ def widget_js() -> str:
         padding: 16px 0;
         border-top: 1px solid var(--line);
       }
-      .calendar-widget__item:first-child { border-top: 0; }
+      .calendar-widget__item:first-of-type {
+        border-top: 0;
+      }
       .calendar-widget__meta {
-        font-size: 0.92rem;
+        font-family: "Quattrocento", Georgia, serif;
+        font-size: 0.98rem;
         line-height: 1.45;
         color: var(--muted);
       }
       .calendar-widget__date {
         display: block;
-        font-weight: 600;
+        font-weight: 700;
         color: var(--ink);
         margin-bottom: 2px;
       }
-      .calendar-widget__time { display: block; }
-      .calendar-widget__name {
+      .calendar-widget__time {
+        display: block;
+      }
+      .calendar-widget__details {
+        margin: 0;
+      }
+      .calendar-widget__summary {
+        list-style: none;
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 0.75rem;
+        cursor: pointer;
+        font-family: "Quattrocento Sans", system-ui, sans-serif;
         font-size: 1.06rem;
         line-height: 1.45;
-        font-weight: 500;
+        font-weight: 400;
         letter-spacing: 0.01em;
+        user-select: none;
+      }
+      .calendar-widget__summary::-webkit-details-marker {
+        display: none;
+      }
+      .calendar-widget__summary-title {
+        display: inline-block;
+      }
+      .calendar-widget__chevron {
+        flex: 0 0 auto;
+        transition: transform 180ms ease;
+        color: var(--muted);
+        transform: translateY(0.1em);
+      }
+      .calendar-widget__details[open] .calendar-widget__chevron {
+        transform: rotate(90deg) translateX(0.05em);
       }
       .calendar-widget__location {
-        margin-top: 0.25rem;
+        margin-top: 0.2rem;
         color: var(--muted);
-        font-size: 0.95rem;
+        font-family: "Quattrocento Sans", system-ui, sans-serif;
+        font-size: 0.93rem;
       }
-      .calendar-widget__name a {
+      .calendar-widget__description {
+        margin-top: 0.75rem;
+        font-family: "Quattrocento Sans", system-ui, sans-serif;
+        font-size: 0.96rem;
+        line-height: 1.58;
+        color: var(--ink);
+      }
+      .calendar-widget__description p {
+        margin: 0 0 0.8rem;
+      }
+      .calendar-widget__description p:last-child {
+        margin-bottom: 0;
+      }
+      .calendar-widget__description a {
         color: inherit;
-        text-decoration: none;
-      }
-      .calendar-widget__name a:hover {
         text-decoration: underline;
-        text-underline-offset: 3px;
+        text-underline-offset: 0.15em;
       }
-      .calendar-widget__item:hover { background: var(--soft); }
+      .calendar-widget__summary:hover .calendar-widget__summary-title {
+        text-decoration: underline;
+        text-underline-offset: 0.16em;
+      }
       .calendar-widget__empty,
       .calendar-widget__error {
         padding: 16px 0;
         color: var(--muted);
+        font-family: "Quattrocento Sans", system-ui, sans-serif;
         font-size: 0.95rem;
         line-height: 1.5;
       }
@@ -788,7 +923,9 @@ def widget_js() -> str:
           grid-template-columns: 1fr;
           gap: 6px;
         }
-        .calendar-widget__title { font-size: 1.3rem; }
+        .calendar-widget__title {
+          font-size: 1.3rem;
+        }
       }
     `;
     document.head.appendChild(style);
