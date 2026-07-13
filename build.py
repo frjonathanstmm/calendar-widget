@@ -712,13 +712,11 @@ def widget_js() -> str:
 
     root.classList.add("calendar-widget");
     root.innerHTML = `
-      <div class="calendar-widget__head">
-        <div>
-          <h3 class="calendar-widget__title">Upcoming services and events</h3>
-        </div>
-      </div>
-      <div class="calendar-widget__list" data-calendar-list aria-live="polite"></div>
-    `;
+  <div class="calendar-widget__head">
+    <h3 class="calendar-widget__title">Upcoming services and events</h3>
+  </div>
+  <div class="calendar-widget__list" data-calendar-list aria-live="polite"></div>
+`;
 
     const listEl = root.querySelector("[data-calendar-list]");
 
@@ -803,14 +801,6 @@ def widget_js() -> str:
         align-items: end;
         gap: 16px;
         margin-bottom: 14px;
-      }
-      .calendar-widget__kicker {
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
-        font-size: 0.72rem;
-        color: var(--muted);
-        margin-bottom: 6px;
-        font-family: "Quattrocento Sans", "Lato", sans-serif;
       }
       .calendar-widget__title {
         margin: 0;
