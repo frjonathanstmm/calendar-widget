@@ -10,6 +10,12 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+try:
+    from dateutil.rrule import rruleset, rrulestr
+except Exception:  # pragma: no cover
+    rruleset = None
+    rrulestr = None
+
 ICS_URL = os.environ.get(
     "ICS_URL",
     "https://calendar.google.com/calendar/ical/c_4a5a1fc5afb51323ac2d430ac7566576eb3385682877769438f6eee2a1037f02%40group.calendar.google.com/public/basic.ics",
@@ -117,30 +123,35 @@ def parse_ics_datetime(value: str, params: dict[str, str]) -> tuple[datetime, bo
 def parse_dt_list(value: str, params: dict[str, str]) -> list[datetime]:
     out: list[datetime] = []
     for part in value.split(","):
-        dt, _ = parse_ics_datetime(part.strip(), params)
+        part = part.strip()
+        if not part:
+            continue
+        dt, _ = parse_ics_datetime(part, params)
         out.append(dt)
     return out
 
 
 def parse_rrule(rrule: str) -> dict[str, str]:
-    result: dict[str, str] = {}
+    out: dict[str, str] = {}
     for chunk in rrule.split(";"):
         if "=" in chunk:
             k, v = chunk.split("=", 1)
-            result[k.upper()] = v
-    return result
+            out[k.upper()] = v
+    return out
 
 
-def parse_weekdays(value: str | None) -> list[int]:
+def parse_byday_tokens(value: str | None) -> list[tuple[int | None, int]]:
     if not value:
         return []
-    out: list[int] = []
+    out: list[tuple[int | None, int]] = []
     for token in value.split(","):
         token = token.strip().upper()
         m = re.fullmatch(r"([+-]?\d+)?(MO|TU|WE|TH|FR|SA|SU)", token)
         if not m:
             continue
-        out.append(WEEKDAY_MAP[m.group(2)])
+        ordinal = int(m.group(1)) if m.group(1) else None
+        weekday = WEEKDAY_MAP[m.group(2)]
+        out.append((ordinal, weekday))
     return out
 
 
@@ -191,6 +202,38 @@ def combine_date_with_time(base: datetime, d: date) -> datetime:
             tzinfo=base.tzinfo,
         ),
     )
+
+
+def nth_weekday_of_month(year: int, month: int, weekday: int, ordinal: int) -> date | None:
+    if ordinal == 0:
+        return None
+
+    if ordinal > 0:
+        first = date(year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        day = 1 + offset + (ordinal - 1) * 7
+        last_day = calendar.monthrange(year, month)[1]
+        if day > last_day:
+            return None
+        return date(year, month, day)
+
+    last_day = calendar.monthrange(year, month)[1]
+    last = date(year, month, last_day)
+    offset = (last.weekday() - weekday) % 7
+    day = last_day - offset + (ordinal + 1) * 7
+    if day < 1 or day > last_day:
+        return None
+    return date(year, month, day)
+
+
+def all_weekday_dates_in_month(year: int, month: int, weekday: int) -> list[date]:
+    days: list[date] = []
+    last_day = calendar.monthrange(year, month)[1]
+    for dom in range(1, last_day + 1):
+        d = date(year, month, dom)
+        if d.weekday() == weekday:
+            days.append(d)
+    return days
 
 
 def occurrence_duration(event: RawEvent) -> timedelta:
@@ -276,158 +319,200 @@ def parse_events(ics_text: str) -> list[RawEvent]:
     return out
 
 
-def generate_rrule_starts(event: RawEvent, rule_text: str, window_end: datetime) -> list[datetime]:
-    rule = parse_rrule(rule_text)
-    freq = rule.get("FREQ", "").upper()
-    interval = max(int(rule.get("INTERVAL", "1")), 1)
-    count = int(rule["COUNT"]) if "COUNT" in rule and rule["COUNT"].isdigit() else None
-    until = parse_until(rule.get("UNTIL"))
+def expand_starts_with_dateutil(master: RawEvent, window_end: datetime) -> list[datetime]:
+    if rrulestr is None:
+        return []
 
-    byday = parse_weekdays(rule.get("BYDAY"))
-    bymonthday = parse_int_list(rule.get("BYMONTHDAY"))
+    try:
+        rs = rruleset()
+        if master.rrule:
+            rs.rrule(rrulestr(master.rrule, dtstart=master.start))
+        else:
+            rs.rdate(master.start)
+        for rdate in master.rdates:
+            rs.rdate(rdate)
+        for exdate in master.exdates:
+            rs.exdate(exdate)
+        after = master.start - timedelta(seconds=1)
+        return list(rs.between(after, window_end, inc=True))
+    except Exception:
+        return []
+
+
+def expand_starts_fallback(master: RawEvent, window_end: datetime) -> list[datetime]:
+    if not master.rrule:
+        starts = [master.start] + master.rdates
+        return sorted(set(dt for dt in starts if dt < window_end))
+
+    rule = parse_rrule(master.rrule)
+    freq = rule.get("FREQ", "").upper()
+    interval = max(int(rule.get("INTERVAL", "1") or "1"), 1)
+    count = int(rule["COUNT"]) if rule.get("COUNT", "").isdigit() else None
+    until = parse_until(rule.get("UNTIL"))
     bymonth = parse_int_list(rule.get("BYMONTH"))
+    bymonthday = parse_int_list(rule.get("BYMONTHDAY"))
+    byday = parse_byday_tokens(rule.get("BYDAY"))
+    exset = {d.isoformat() for d in master.exdates}
 
     starts: list[datetime] = []
-    generated = 0
+    added = 0
 
-    def accept(dt: datetime) -> bool:
-        nonlocal generated
-        if dt < event.start:
+    def can_add(dt: datetime) -> bool:
+        nonlocal added
+        if dt < master.start:
+            return False
+        if dt >= window_end:
             return False
         if until and dt > until:
             return False
-        if count is not None and generated >= count:
+        if dt.isoformat() in exset:
             return False
         if bymonth and dt.month not in bymonth:
             return False
         if bymonthday and dt.day not in bymonthday:
             return False
+        if count is not None and added >= count:
+            return False
         return True
 
     if freq == "DAILY":
-        current = event.start
-        while current < window_end:
-            if accept(current):
+        current = master.start
+        guard = 0
+        while current < window_end and guard < 5000:
+            if can_add(current):
                 starts.append(current)
-                generated += 1
-            if count is not None and generated >= count:
+                added += 1
+            if count is not None and added >= count:
                 break
-            current = current + timedelta(days=interval)
+            current += timedelta(days=interval)
+            guard += 1
 
     elif freq == "WEEKLY":
-        weekdays = byday or [event.start.weekday()]
-        anchor = event.start.date() - timedelta(days=event.start.weekday())
-        week = 0
-        while True:
-            week_start = anchor + timedelta(weeks=week * interval)
-            for wd in sorted(set(weekdays)):
-                cand = combine_date_with_time(event.start, week_start + timedelta(days=wd))
-                if cand >= window_end:
-                    if until and cand > until:
-                        return starts
-                    continue
-                if accept(cand):
+        weekdays = [weekday for ordinal, weekday in byday if ordinal is None] or [master.start.weekday()]
+        anchor = master.start.date() - timedelta(days=master.start.weekday())
+        week_index = 0
+        guard = 0
+        while guard < 2000:
+            week_start = anchor + timedelta(weeks=week_index * interval)
+            if datetime.combine(week_start, time.min, tzinfo=SITE_TZ) >= window_end:
+                break
+            for weekday in sorted(set(weekdays)):
+                cand_date = week_start + timedelta(days=weekday)
+                cand = combine_date_with_time(master.start, cand_date)
+                if can_add(cand):
                     starts.append(cand)
-                    generated += 1
-                if count is not None and generated >= count:
-                    return starts
-            week += 1
-            if week_start > window_end and not weekdays:
+                    added += 1
+                    if count is not None and added >= count:
+                        break
+            if count is not None and added >= count:
                 break
-            if until and week_start > until.date():
-                break
+            week_index += 1
+            guard += 1
 
     elif freq == "MONTHLY":
         month_index = 0
-        doms = bymonthday or [event.start.day]
-        while True:
-            month_base = add_months(event.start, month_index * interval)
-            if month_base > window_end:
+        guard = 0
+        while guard < 500:
+            base = add_months(master.start, month_index * interval)
+            if base >= window_end:
                 break
-            for dom in doms:
-                last_dom = calendar.monthrange(month_base.year, month_base.month)[1]
-                if dom < 1 or dom > last_dom:
-                    continue
-                cand = combine_date_with_time(
-                    event.start,
-                    date(month_base.year, month_base.month, dom),
-                )
-                if cand >= window_end:
-                    if until and cand > until:
-                        return starts
-                    continue
-                if accept(cand):
+
+            candidates: list[date] = []
+            year, month = base.year, base.month
+
+            if byday:
+                ordinals_present = any(ordinal is not None for ordinal, _ in byday)
+                if ordinals_present:
+                    for ordinal, weekday in byday:
+                        if ordinal is None:
+                            candidates.extend(all_weekday_dates_in_month(year, month, weekday))
+                        else:
+                            d = nth_weekday_of_month(year, month, weekday, ordinal)
+                            if d is not None:
+                                candidates.append(d)
+                else:
+                    for _, weekday in byday:
+                        candidates.extend(all_weekday_dates_in_month(year, month, weekday))
+            elif bymonthday:
+                last_day = calendar.monthrange(year, month)[1]
+                for dom in bymonthday:
+                    if 1 <= dom <= last_day:
+                        candidates.append(date(year, month, dom))
+            else:
+                dom = min(master.start.day, calendar.monthrange(year, month)[1])
+                candidates.append(date(year, month, dom))
+
+            for d in sorted(set(candidates)):
+                cand = combine_date_with_time(master.start, d)
+                if can_add(cand):
                     starts.append(cand)
-                    generated += 1
-                if count is not None and generated >= count:
-                    return starts
-            month_index += 1
-            if until and month_base > until:
+                    added += 1
+                    if count is not None and added >= count:
+                        break
+
+            if count is not None and added >= count:
                 break
+            month_index += 1
+            guard += 1
 
     elif freq == "YEARLY":
         year_index = 0
-        months = bymonth or [event.start.month]
-        doms = bymonthday or [event.start.day]
-        while True:
-            base_year = event.start.year + year_index * interval
-            if datetime(base_year, 1, 1, tzinfo=SITE_TZ) > window_end:
+        guard = 0
+        months = bymonth or [master.start.month]
+        doms = bymonthday or [master.start.day]
+
+        while guard < 200:
+            year = master.start.year + year_index * interval
+            if datetime(year, 1, 1, tzinfo=SITE_TZ) >= window_end:
                 break
-            for month_num in months:
-                if month_num < 1 or month_num > 12:
+
+            for month in months:
+                if month < 1 or month > 12:
                     continue
-                last_dom = calendar.monthrange(base_year, month_num)[1]
+                last_day = calendar.monthrange(year, month)[1]
                 for dom in doms:
-                    if dom < 1 or dom > last_dom:
+                    if dom < 1 or dom > last_day:
                         continue
-                    cand = combine_date_with_time(
-                        event.start,
-                        date(base_year, month_num, dom),
-                    )
-                    if cand >= window_end:
-                        if until and cand > until:
-                            return starts
-                        continue
-                    if accept(cand):
+                    cand = combine_date_with_time(master.start, date(year, month, dom))
+                    if can_add(cand):
                         starts.append(cand)
-                        generated += 1
-                    if count is not None and generated >= count:
-                        return starts
-            year_index += 1
-            if until and datetime(base_year, 12, 31, tzinfo=SITE_TZ) > until:
+                        added += 1
+                        if count is not None and added >= count:
+                            break
+                if count is not None and added >= count:
+                    break
+
+            if count is not None and added >= count:
                 break
+            year_index += 1
+            guard += 1
 
     else:
-        # Fallback for uncommon RRULEs: treat the DTSTART as the only start.
-        if event.start < window_end:
-            starts.append(event.start)
+        starts.append(master.start)
 
-    # Include explicit RDATEs.
-    for rdate in event.rdates:
-        if rdate < event.start:
-            continue
-        if rdate >= window_end:
-            continue
-        if until and rdate > until:
-            continue
-        starts.append(rdate)
+    starts.extend([r for r in master.rdates if master.start <= r < window_end and r.isoformat() not in exset])
 
-    # De-duplicate while preserving order.
-    seen: set[str] = set()
     unique: list[datetime] = []
-    for dt in starts:
+    seen: set[str] = set()
+    for dt in sorted(starts):
         key = dt.isoformat()
         if key in seen:
             continue
         seen.add(key)
         unique.append(dt)
-    unique.sort()
     return unique
+
+
+def expand_occurrence_starts(master: RawEvent, window_end: datetime) -> list[datetime]:
+    starts = expand_starts_with_dateutil(master, window_end)
+    if starts:
+        return starts
+    return expand_starts_fallback(master, window_end)
 
 
 def expand_events(events: list[RawEvent]) -> list[Event]:
     now = datetime.now(tz=SITE_TZ)
-    cutoff = now + timedelta(days=WINDOW_DAYS)
+    window_end = now + timedelta(days=WINDOW_DAYS)
 
     overrides: dict[tuple[str, str], RawEvent] = {}
     masters: dict[str, list[RawEvent]] = {}
@@ -443,53 +528,38 @@ def expand_events(events: list[RawEvent]) -> list[Event]:
 
     expanded: list[Event] = []
 
-    def emit(raw: RawEvent, start: datetime, end: datetime | None, all_day: bool) -> None:
-        if end is None:
-            end = start + occurrence_duration(raw)
-        if end >= now and start < cutoff:
+    def emit(source: RawEvent, start: datetime, end: datetime | None, all_day: bool) -> None:
+        final_end = end
+        if final_end is None:
+            final_end = start + occurrence_duration(source)
+        if final_end >= now and start < window_end:
             expanded.append(
                 Event(
-                    summary=raw.summary,
+                    summary=source.summary,
                     start=start,
-                    end=end,
+                    end=final_end,
                     all_day=all_day,
-                    location=raw.location,
-                    url=raw.url,
+                    location=source.location,
+                    url=source.url,
                 )
             )
 
-    # Single events and non-recurring overrides with no master.
     for raw in singles:
         emit(raw, raw.start, raw.end, raw.all_day)
 
-    # Recurring masters.
-    for uid, series in masters.items():
-        # Usually one master per UID; if there are several, process each independently.
+    for series in masters.values():
         for master in series:
             duration = occurrence_duration(master)
-            starts = generate_rrule_starts(master, master.rrule, cutoff) if master.rrule else []
-            if not starts and master.rdates:
-                starts = [dt for dt in master.rdates if dt >= master.start and dt < cutoff]
-
-            if not master.rrule and not master.rdates:
-                emit(master, master.start, master.end, master.all_day)
-                continue
-
-            # Add explicit start if a rule exists but DTSTART wasn't included above.
-            if master.start >= master.start and master.start < cutoff:
-                if master.start not in starts:
-                    starts.insert(0, master.start)
+            starts = expand_occurrence_starts(master, window_end)
 
             for start in starts:
                 if start < master.start:
                     continue
-                if start >= cutoff:
-                    continue
-                if start in master.exdates:
+                if start >= window_end:
                     continue
 
                 override = overrides.get(event_key(master.uid, start))
-                if override:
+                if override is not None:
                     emit(
                         override,
                         override.start,
@@ -497,7 +567,12 @@ def expand_events(events: list[RawEvent]) -> list[Event]:
                         override.all_day,
                     )
                 else:
-                    emit(master, start, start + duration if master.end is not None or master.all_day else None, master.all_day)
+                    emit(
+                        master,
+                        start,
+                        start + duration if master.end is not None or master.all_day else None,
+                        master.all_day,
+                    )
 
     expanded.sort(key=lambda e: e.start)
     return expanded
@@ -560,7 +635,7 @@ def widget_js() -> str:
     if (event.all_day) return "All day";
     if (!event.start) return "";
     if (!event.end) return formatTime(event.start);
-    return `${formatTime(event.start)} – ${formatTime(event.end)}`;
+    return `${formatTime(event.start)} - ${formatTime(event.end)}`;
   }
 
   function render(target, events) {
@@ -745,8 +820,8 @@ def widget_js() -> str:
 
 
 def main() -> None:
-    raw = fetch_ics(ICS_URL)
-    events = expand_events(parse_events(raw))
+    raw_ics = fetch_ics(ICS_URL)
+    events = expand_events(parse_events(raw_ics))
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
     (OUTDIR / "events.json").write_text(
