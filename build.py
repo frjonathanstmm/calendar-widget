@@ -3,186 +3,420 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
-from dataclasses import dataclass, asdict
-from datetime import date, datetime, timedelta, timezone
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Optional
-from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-ICS_URL = "https://calendar.google.com/calendar/ical/c_4a5a1fc5afb51323ac2d430ac7566576eb3385682877769438f6eee2a1037f02%40group.calendar.google.com/public/basic.ics"
-TIME_ZONE = ZoneInfo("Europe/London")
-OUT_DIR = Path("docs")
-OUT_JSON = OUT_DIR / "events.json"
-OUT_INDEX = OUT_DIR / "index.html"
+ICS_URL = os.environ.get(
+    "ICS_URL",
+    "https://calendar.google.com/calendar/ical/c_4a5a1fc5afb51323ac2d430ac7566576eb3385682877769438f6eee2a1037f02%40group.calendar.google.com/public/basic.ics",
+)
+SITE_TZ = ZoneInfo(os.environ.get("SITE_TIME_ZONE", "Europe/London"))
+OUTDIR = Path("dist")
+EVENT_LIMIT = int(os.environ.get("EVENT_LIMIT", "20"))
 
 
 @dataclass
 class Event:
     summary: str
-    location: str
-    url: str
-    start_iso: str
-    end_iso: str
-    all_day: bool
-    sort_key: str
+    start: datetime
+    end: datetime | None
+    all_day: bool = False
+    location: str = ""
+    url: str = ""
 
 
 def fetch_ics(url: str) -> str:
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0 calendar-widget-bot"})
-    with urlopen(req, timeout=30) as resp:
-        raw = resp.read()
-    return raw.decode("utf-8", errors="replace")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return resp.read().decode(charset, errors="replace")
 
 
-def unfold_ics(text: str) -> str:
-    return re.sub(r"\r?\n[ \t]", "", text.replace("\r\n", "\n").replace("\r", "\n"))
+def unfold_ics(text: str) -> list[str]:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    raw_lines = text.split("\n")
+    lines: list[str] = []
+    for line in raw_lines:
+        if line.startswith((" ", "\t")) and lines:
+            lines[-1] += line[1:]
+        else:
+            lines.append(line)
+    return lines
 
 
-def parse_ics_line(line: str):
-    left, value = line.split(":", 1)
-    parts = left.split(";")
-    name = parts[0].upper()
-    params = {}
-    for part in parts[1:]:
-        if "=" in part:
-            k, v = part.split("=", 1)
-            params[k.upper()] = v
-    return name, value, params
+_prop_re = re.compile(r"^([A-Z0-9-]+)(;[^:]*)?:(.*)$")
 
 
-def ics_unescape(value: str) -> str:
-    return (
-        value.replace(r"\\", "\\")
-        .replace(r"\n", "\n")
-        .replace(r"\N", "\n")
-        .replace(r"\,", ",")
-        .replace(r"\;", ";")
-    )
+def parse_line(line: str):
+    m = _prop_re.match(line)
+    if not m:
+        return None
+    name = m.group(1).upper()
+    params_part = m.group(2) or ""
+    value = m.group(3)
+    params: dict[str, str] = {}
+    if params_part:
+        for chunk in params_part.lstrip(";").split(";"):
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                params[k.upper()] = v
+    return name, params, value
 
 
-def parse_dt(value: str, params: dict[str, str]) -> tuple[datetime, bool]:
-    value = value.strip()
-    is_date = params.get("VALUE", "").upper() == "DATE" or re.fullmatch(r"\d{8}", value) is not None
-    if is_date:
-        dt = datetime.strptime(value[:8], "%Y%m%d").replace(tzinfo=TIME_ZONE)
+def parse_ics_datetime(value: str, params: dict[str, str]) -> tuple[datetime, bool]:
+    if params.get("VALUE", "").upper() == "DATE" or re.fullmatch(r"\d{8}", value):
+        d = datetime.strptime(value[:8], "%Y%m%d").date()
+        dt = datetime.combine(d, time.min, tzinfo=SITE_TZ)
         return dt, True
 
-    tzid = params.get("TZID")
     if value.endswith("Z"):
-        dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).astimezone(TIME_ZONE)
-        return dt, False
+        dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        return dt.astimezone(SITE_TZ), False
 
-    dt = datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
-    if tzid:
+    dt = datetime.strptime(value, "%Y%m%dT%H%M%S")
+    tz_name = params.get("TZID")
+    if tz_name:
         try:
-            dt = dt.replace(tzinfo=ZoneInfo(tzid)).astimezone(TIME_ZONE)
+            dt = dt.replace(tzinfo=ZoneInfo(tz_name))
         except Exception:
-            dt = dt.replace(tzinfo=TIME_ZONE)
+            dt = dt.replace(tzinfo=SITE_TZ)
     else:
-        dt = dt.replace(tzinfo=TIME_ZONE)
-    return dt, False
+        dt = dt.replace(tzinfo=SITE_TZ)
+    return dt.astimezone(SITE_TZ), False
 
 
 def parse_events(ics_text: str) -> list[Event]:
-    lines = unfold_ics(ics_text).split("\n")
-    raw_events = []
-    current: Optional[dict] = None
+    lines = unfold_ics(ics_text)
+    events: list[dict] = []
+    current: dict | None = None
 
     for line in lines:
-        line = line.strip()
         if line == "BEGIN:VEVENT":
             current = {}
             continue
         if line == "END:VEVENT":
-            if current:
-                raw_events.append(current)
+            if current is not None:
+                events.append(current)
             current = None
             continue
-        if not current or ":" not in line:
+        if current is None:
             continue
-
-        name, value, params = parse_ics_line(line)
-        value = ics_unescape(value)
-
-        if name in {"SUMMARY", "LOCATION", "URL"}:
-            current[name.lower()] = value
-        elif name in {"DTSTART", "DTEND"}:
-            dt, all_day = parse_dt(value, params)
-            current[name.lower()] = dt
-            current[f"{name.lower()}_all_day"] = all_day
-
-    now = datetime.now(TIME_ZONE)
-    upper = now + timedelta(days=120)
-    events: list[Event] = []
-
-    for item in raw_events:
-        start = item.get("dtstart")
-        if not isinstance(start, datetime):
+        parsed = parse_line(line)
+        if not parsed:
             continue
-        if start < now or start > upper:
+        name, params, value = parsed
+        if name == "SUMMARY":
+            current["summary"] = value
+        elif name == "LOCATION":
+            current["location"] = value
+        elif name == "URL":
+            current["url"] = value
+        elif name == "DTSTART":
+            start_dt, all_day = parse_ics_datetime(value, params)
+            current["start"] = start_dt
+            current["all_day"] = all_day
+        elif name == "DTEND":
+            end_dt, _ = parse_ics_datetime(value, params)
+            current["end"] = end_dt
+
+    out: list[Event] = []
+    for e in events:
+        if "start" not in e:
             continue
-
-        end = item.get("dtend")
-        all_day = bool(item.get("dtstart_all_day"))
-        if not isinstance(end, datetime):
-            end = start + (timedelta(days=1) if all_day else timedelta(hours=1))
-
-        events.append(
+        out.append(
             Event(
-                summary=(item.get("summary") or "Untitled event").strip(),
-                location=(item.get("location") or "").strip(),
-                url=(item.get("url") or "").strip(),
-                start_iso=start.isoformat(),
-                end_iso=end.isoformat(),
-                all_day=all_day,
-                sort_key=start.isoformat(),
+                summary=str(e.get("summary", "Untitled event")),
+                start=e["start"],
+                end=e.get("end"),
+                all_day=bool(e.get("all_day", False)),
+                location=str(e.get("location", "")),
+                url=str(e.get("url", "")),
             )
         )
-
-    events.sort(key=lambda e: e.sort_key)
-    return events[:20]
+    return out
 
 
-def build_index() -> str:
-    return """<!doctype html>
+def filter_and_sort(events: list[Event]) -> list[Event]:
+    now = datetime.now(tz=SITE_TZ)
+    upcoming = []
+    for event in events:
+        end = event.end or (event.start + timedelta(days=1 if event.all_day else 0))
+        if end >= now:
+            upcoming.append(event)
+    upcoming.sort(key=lambda e: e.start)
+    return upcoming[:EVENT_LIMIT]
+
+
+def to_json(events: list[Event]) -> list[dict]:
+    return [
+        {
+            "summary": e.summary,
+            "start": e.start.isoformat(),
+            "end": e.end.isoformat() if e.end else None,
+            "all_day": e.all_day,
+            "location": e.location,
+            "url": e.url,
+        }
+        for e in events
+    ]
+
+
+def widget_js() -> str:
+    return r'''(function () {
+  const DEFAULT_TARGET = "#calendar-widget";
+  const DEFAULT_LIMIT = 20;
+  const SITE_TZ = "Europe/London";
+
+  const currentScript = document.currentScript;
+  const scriptUrl = currentScript && currentScript.src ? new URL(currentScript.src) : null;
+  const eventsUrl = scriptUrl ? new URL("events.json", scriptUrl) : new URL("events.json", window.location.href);
+
+  const esc = (str) =>
+    String(str).replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    }[ch]));
+
+  function formatDate(value) {
+    const d = new Date(value);
+    return new Intl.DateTimeFormat("en-GB", {
+      weekday: "short",
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      timeZone: SITE_TZ
+    }).format(d);
+  }
+
+  function formatTime(value) {
+    const d = new Date(value);
+    return new Intl.DateTimeFormat("en-GB", {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+      timeZone: SITE_TZ
+    }).format(d);
+  }
+
+  function formatRange(event) {
+    if (event.all_day) return "All day";
+    if (!event.start) return "";
+    if (!event.end) return formatTime(event.start);
+    return `${formatTime(event.start)} – ${formatTime(event.end)}`;
+  }
+
+  function render(target, events) {
+    const root = typeof target === "string" ? document.querySelector(target) : target;
+    if (!root) return;
+
+    root.classList.add("calendar-widget");
+    root.innerHTML = `
+      <div class="calendar-widget__head">
+        <div>
+          <div class="calendar-widget__kicker">Calendar</div>
+          <h3 class="calendar-widget__title">Upcoming events</h3>
+        </div>
+        <div class="calendar-widget__status" data-calendar-status>Loading…</div>
+      </div>
+      <div class="calendar-widget__list" data-calendar-list aria-live="polite"></div>
+    `;
+
+    const statusEl = root.querySelector("[data-calendar-status]");
+    const listEl = root.querySelector("[data-calendar-list]");
+
+    if (!events.length) {
+      listEl.innerHTML = `<div class="calendar-widget__empty">No upcoming events at the moment.</div>`;
+      statusEl.textContent = "Up to date";
+      return;
+    }
+
+    listEl.innerHTML = events.slice(0, DEFAULT_LIMIT).map((event) => {
+      const dateLabel = event.start ? formatDate(event.start) : "";
+      const timeLabel = formatRange(event);
+      const title = event.summary || "Untitled event";
+      const location = event.location ? `<div class="calendar-widget__location">${esc(event.location)}</div>` : "";
+      const titleHtml = event.url
+        ? `<a href="${esc(event.url)}" target="_blank" rel="noopener noreferrer">${esc(title)}</a>`
+        : esc(title);
+
+      return `
+        <article class="calendar-widget__item">
+          <div class="calendar-widget__meta">
+            <span class="calendar-widget__date">${esc(dateLabel)}</span>
+            <span class="calendar-widget__time">${esc(timeLabel)}</span>
+          </div>
+          <div class="calendar-widget__name">${titleHtml}${location}</div>
+        </article>
+      `;
+    }).join("");
+
+    statusEl.textContent = `${events.length} event${events.length === 1 ? "" : "s"}`;
+  }
+
+  function ensureStyles() {
+    if (document.getElementById("calendar-widget-styles")) return;
+    const style = document.createElement("style");
+    style.id = "calendar-widget-styles";
+    style.textContent = `
+      .calendar-widget {
+        --ink: #111;
+        --muted: rgba(17, 17, 17, 0.68);
+        --line: rgba(17, 17, 17, 0.14);
+        --soft: rgba(17, 17, 17, 0.04);
+        max-width: 760px;
+        margin: 0 auto;
+        font-family: Georgia, "Times New Roman", serif;
+        color: var(--ink);
+      }
+      .calendar-widget__head {
+        display: flex;
+        justify-content: space-between;
+        align-items: end;
+        gap: 16px;
+        margin-bottom: 14px;
+      }
+      .calendar-widget__kicker {
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-size: 0.72rem;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+      .calendar-widget__title {
+        margin: 0;
+        font-size: 1.5rem;
+        line-height: 1.15;
+        font-weight: 500;
+      }
+      .calendar-widget__status {
+        font-size: 0.86rem;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .calendar-widget__list {
+        max-height: 420px;
+        overflow-y: auto;
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+      }
+      .calendar-widget__item {
+        display: grid;
+        grid-template-columns: 150px 1fr;
+        gap: 16px;
+        padding: 16px 0;
+        border-top: 1px solid var(--line);
+      }
+      .calendar-widget__item:first-child { border-top: 0; }
+      .calendar-widget__meta {
+        font-size: 0.92rem;
+        line-height: 1.45;
+        color: var(--muted);
+      }
+      .calendar-widget__date {
+        display: block;
+        font-weight: 600;
+        color: var(--ink);
+        margin-bottom: 2px;
+      }
+      .calendar-widget__time { display: block; }
+      .calendar-widget__name {
+        font-size: 1.06rem;
+        line-height: 1.45;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+      }
+      .calendar-widget__location {
+        margin-top: 0.25rem;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+      .calendar-widget__name a {
+        color: inherit;
+        text-decoration: none;
+      }
+      .calendar-widget__name a:hover {
+        text-decoration: underline;
+        text-underline-offset: 3px;
+      }
+      .calendar-widget__item:hover { background: var(--soft); }
+      .calendar-widget__empty,
+      .calendar-widget__error {
+        padding: 16px 0;
+        color: var(--muted);
+        font-size: 0.95rem;
+        line-height: 1.5;
+      }
+      @media (max-width: 640px) {
+        .calendar-widget__head {
+          flex-direction: column;
+          align-items: start;
+        }
+        .calendar-widget__item {
+          grid-template-columns: 1fr;
+          gap: 6px;
+        }
+        .calendar-widget__title { font-size: 1.3rem; }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  async function boot() {
+    ensureStyles();
+    const target = document.querySelector(DEFAULT_TARGET);
+    if (!target) return;
+
+    try {
+      const res = await fetch(eventsUrl.toString(), { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      render(target, Array.isArray(data.events) ? data.events : []);
+    } catch (err) {
+      console.error(err);
+      target.innerHTML = `<div class="calendar-widget__error">The calendar could not be loaded.</div>`;
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
+  }
+})();
+'''
+
+
+def main() -> None:
+    ics = fetch_ics(ICS_URL)
+    events = filter_and_sort(parse_events(ics))
+
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    (OUTDIR / "events.json").write_text(json.dumps({"events": to_json(events)}, indent=2), encoding="utf-8")
+    (OUTDIR / "widget.js").write_text(widget_js(), encoding="utf-8")
+    (OUTDIR / "index.html").write_text(
+        """<!doctype html>
 <html lang=\"en\">
 <head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>Calendar widget</title>
-  <style>
-    body{font-family:Georgia,'Times New Roman',serif;max-width:760px;margin:3rem auto;padding:0 1rem;color:#111;}
-    h1{font-size:1.6rem;font-weight:500;}
-    p{color:rgba(17,17,17,.72);line-height:1.6;}
-    code{background:rgba(17,17,17,.06);padding:.1rem .3rem;border-radius:.25rem;}
-  </style>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>Calendar Widget Preview</title>
+  <style>body{margin:0;padding:40px 20px;background:#fff;color:#111;}</style>
 </head>
 <body>
-  <h1>Calendar widget</h1>
-  <p>This repository publishes <code>events.json</code> and <code>widget.js</code> for Squarespace.</p>
   <div id=\"calendar-widget\"></div>
-  <script src=\"./widget.js\"></script>
+  <script src=\"./widget.js\" defer></script>
 </body>
 </html>
-"""
-
-
-def main() -> int:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    ics = fetch_ics(ICS_URL)
-    events = parse_events(ics)
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "time_zone": "Europe/London",
-        "events": [asdict(e) for e in events],
-    }
-    OUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    OUT_INDEX.write_text(build_index(), encoding="utf-8")
-    print(f"Wrote {OUT_JSON} and {OUT_INDEX} with {len(events)} events")
-    return 0
+""",
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
