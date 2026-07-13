@@ -715,7 +715,7 @@ def widget_js() -> str:
       <div class="calendar-widget__head">
         <div>
           <div class="calendar-widget__kicker">Calendar</div>
-          <h3 class="calendar-widget__title">Upcoming events</h3>
+          <h3 class="calendar-widget__title">Upcoming services and events</h3>
         </div>
       </div>
       <div class="calendar-widget__list" data-calendar-list aria-live="polite"></div>
@@ -724,7 +724,7 @@ def widget_js() -> str:
     const listEl = root.querySelector("[data-calendar-list]");
 
     if (!events.length) {
-      listEl.innerHTML = `<div class="calendar-widget__empty">No upcoming events at the moment.</div>`;
+      listEl.innerHTML = `<div class="calendar-widget__empty">No upcoming services/events at the moment.</div>`;
       return;
     }
 
