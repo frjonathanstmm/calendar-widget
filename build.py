@@ -714,7 +714,6 @@ def widget_js() -> str:
     root.innerHTML = `
       <div class="calendar-widget__head">
         <div>
-          <div class="calendar-widget__kicker">Calendar</div>
           <h3 class="calendar-widget__title">Upcoming services and events</h3>
         </div>
       </div>
