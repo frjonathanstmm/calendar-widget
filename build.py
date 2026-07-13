@@ -1,4 +1,4 @@
-from __future__ import annotations
+    from __future__ import annotations
 
 import calendar
 import json
@@ -792,6 +792,12 @@ def widget_js() -> str:
         --soft: rgba(17, 17, 17, 0.04);
         max-width: 760px;
         margin: 0 auto;
+        
+        border: 6px solid var(--ink);
+        padding: 24px 28px;
+        box-sizing: border-box;
+        background: #fff;
+        
         color: var(--ink);
         font-family: "Quattrocento Sans", "Lato", sans-serif;
       }
