@@ -698,7 +698,7 @@ def widget_js() -> str:
         --soft: rgba(17, 17, 17, 0.04);
         max-width: 760px;
         margin: 0 auto;
-        font-family: Georgia, "Times New Roman", serif;
+        font-family: Quattrocento, Perpetua, serif;
         color: var(--ink);
       }
       .calendar-widget__head {
