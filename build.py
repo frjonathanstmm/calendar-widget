@@ -11,7 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 try:
-    from dateutil.rrule import rruleset, rrulestr  # type: ignore
+    from dateutil.rrule import rruleset, rrulestr
 except Exception:  # pragma: no cover
     rruleset = None
     rrulestr = None
@@ -39,12 +39,12 @@ WEEKDAY_MAP = {
 class RawEvent:
     uid: str
     summary: str
-    start: datetime
-    end: datetime | None
+    description: str = ""
+    start: datetime = datetime.now(tz=SITE_TZ)
+    end: datetime | None = None
     all_day: bool = False
     location: str = ""
     url: str = ""
-    description: str = ""
     rrule: str = ""
     rdates: list[datetime] = field(default_factory=list)
     exdates: list[datetime] = field(default_factory=list)
@@ -54,12 +54,12 @@ class RawEvent:
 @dataclass
 class Event:
     summary: str
+    description: str
     start: datetime
     end: datetime | None
     all_day: bool = False
     location: str = ""
     url: str = ""
-    description: str = ""
 
 
 def fetch_ics(url: str) -> str:
@@ -100,14 +100,23 @@ def parse_line(line: str):
     return name, params, value
 
 
-def decode_ical_text(value: str) -> str:
-    return (
-        value.replace("\\\\", "\\")
-        .replace("\\n", "\n")
-        .replace("\\N", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-    )
+_text_unescape_re = re.compile(r"\\([nN\\;,])")
+
+
+def unescape_ics_text(value: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        ch = match.group(1)
+        if ch in ("n", "N"):
+            return "\n"
+        if ch == "\\":
+            return "\\"
+        if ch == ";":
+            return ";"
+        if ch == ",":
+            return ","
+        return ch
+
+    return _text_unescape_re.sub(repl, value)
 
 
 def parse_ics_datetime(value: str, params: dict[str, str]) -> tuple[datetime, bool]:
@@ -284,15 +293,15 @@ def parse_events(ics_text: str) -> list[RawEvent]:
         name, params, value = parsed
 
         if name == "UID":
-            current["uid"] = decode_ical_text(value)
+            current["uid"] = value
         elif name == "SUMMARY":
-            current["summary"] = decode_ical_text(value)
-        elif name == "LOCATION":
-            current["location"] = decode_ical_text(value)
-        elif name == "URL":
-            current["url"] = decode_ical_text(value)
+            current["summary"] = unescape_ics_text(value)
         elif name == "DESCRIPTION":
-            current["description"] = decode_ical_text(value)
+            current["description"] = unescape_ics_text(value)
+        elif name == "LOCATION":
+            current["location"] = unescape_ics_text(value)
+        elif name == "URL":
+            current["url"] = unescape_ics_text(value)
         elif name == "RRULE":
             current["rrule"] = value
         elif name == "RECURRENCE-ID":
@@ -319,12 +328,12 @@ def parse_events(ics_text: str) -> list[RawEvent]:
             RawEvent(
                 uid=uid,
                 summary=str(e.get("summary", "Untitled event")),
+                description=str(e.get("description", "")),
                 start=e["start"],
                 end=e.get("end"),
                 all_day=bool(e.get("all_day", False)),
                 location=str(e.get("location", "")),
                 url=str(e.get("url", "")),
-                description=str(e.get("description", "")),
                 rrule=str(e.get("rrule", "")),
                 rdates=list(e.get("rdates", [])),
                 exdates=list(e.get("exdates", [])),
@@ -334,197 +343,25 @@ def parse_events(ics_text: str) -> list[RawEvent]:
     return out
 
 
-def expand_starts_with_dateutil(master: RawEvent, window_end: datetime) -> list[datetime]:
-    if rrulestr is None or rruleset is None:
-        return []
-
-    try:
-        rs = rruleset()
-        if master.rrule:
+def expand_starts(master: RawEvent, window_end: datetime) -> list[datetime]:
+    if rrulestr is not None and master.rrule:
+        try:
+            rs = rruleset()
             rs.rrule(rrulestr(master.rrule, dtstart=master.start))
-        else:
-            rs.rdate(master.start)
-        for rdate in master.rdates:
-            rs.rdate(rdate)
-        for exdate in master.exdates:
-            rs.exdate(exdate)
-        after = master.start - timedelta(seconds=1)
-        return list(rs.between(after, window_end, inc=True))
-    except Exception:
-        return []
+            for rdate in master.rdates:
+                rs.rdate(rdate)
+            for exdate in master.exdates:
+                rs.exdate(exdate)
+            starts = list(rs.between(master.start - timedelta(seconds=1), window_end, inc=True))
+            if master.start not in starts and master.start < window_end:
+                starts.insert(0, master.start)
+            return sorted(set(starts))
+        except Exception:
+            pass
 
-
-def expand_starts_fallback(master: RawEvent, window_end: datetime) -> list[datetime]:
-    if not master.rrule:
-        starts = [master.start] + master.rdates
-        exset = {d.isoformat() for d in master.exdates}
-        unique = sorted({dt for dt in starts if dt < window_end and dt.isoformat() not in exset})
-        return unique
-
-    rule = parse_rrule(master.rrule)
-    freq = rule.get("FREQ", "").upper()
-    interval = max(int(rule.get("INTERVAL", "1") or "1"), 1)
-    count = int(rule["COUNT"]) if rule.get("COUNT", "").isdigit() else None
-    until = parse_until(rule.get("UNTIL"))
-    bymonth = parse_int_list(rule.get("BYMONTH"))
-    bymonthday = parse_int_list(rule.get("BYMONTHDAY"))
-    byday = parse_byday_tokens(rule.get("BYDAY"))
-    exset = {d.isoformat() for d in master.exdates}
-
-    starts: list[datetime] = []
-    added = 0
-
-    def can_add(dt: datetime) -> bool:
-        nonlocal added
-        if dt < master.start:
-            return False
-        if dt >= window_end:
-            return False
-        if until and dt > until:
-            return False
-        if dt.isoformat() in exset:
-            return False
-        if bymonth and dt.month not in bymonth:
-            return False
-        if bymonthday and dt.day not in bymonthday:
-            return False
-        if count is not None and added >= count:
-            return False
-        return True
-
-    if freq == "DAILY":
-        current = master.start
-        guard = 0
-        while current < window_end and guard < 5000:
-            if can_add(current):
-                starts.append(current)
-                added += 1
-            if count is not None and added >= count:
-                break
-            current += timedelta(days=interval)
-            guard += 1
-
-    elif freq == "WEEKLY":
-        weekdays = [weekday for ordinal, weekday in byday if ordinal is None] or [master.start.weekday()]
-        anchor = master.start.date() - timedelta(days=master.start.weekday())
-        week_index = 0
-        guard = 0
-        while guard < 2000:
-            week_start = anchor + timedelta(weeks=week_index * interval)
-            if datetime.combine(week_start, time.min, tzinfo=SITE_TZ) >= window_end:
-                break
-            for weekday in sorted(set(weekdays)):
-                cand_date = week_start + timedelta(days=weekday)
-                cand = combine_date_with_time(master.start, cand_date)
-                if can_add(cand):
-                    starts.append(cand)
-                    added += 1
-                    if count is not None and added >= count:
-                        break
-            if count is not None and added >= count:
-                break
-            week_index += 1
-            guard += 1
-
-    elif freq == "MONTHLY":
-        month_index = 0
-        guard = 0
-        while guard < 500:
-            base = add_months(master.start, month_index * interval)
-            if base >= window_end:
-                break
-
-            candidates: list[date] = []
-            year, month = base.year, base.month
-
-            if byday:
-                ordinals_present = any(ordinal is not None for ordinal, _ in byday)
-                if ordinals_present:
-                    for ordinal, weekday in byday:
-                        if ordinal is None:
-                            candidates.extend(all_weekday_dates_in_month(year, month, weekday))
-                        else:
-                            d = nth_weekday_of_month(year, month, weekday, ordinal)
-                            if d is not None:
-                                candidates.append(d)
-                else:
-                    for _, weekday in byday:
-                        candidates.extend(all_weekday_dates_in_month(year, month, weekday))
-            elif bymonthday:
-                last_day = calendar.monthrange(year, month)[1]
-                for dom in bymonthday:
-                    if 1 <= dom <= last_day:
-                        candidates.append(date(year, month, dom))
-            else:
-                dom = min(master.start.day, calendar.monthrange(year, month)[1])
-                candidates.append(date(year, month, dom))
-
-            for d in sorted(set(candidates)):
-                cand = combine_date_with_time(master.start, d)
-                if can_add(cand):
-                    starts.append(cand)
-                    added += 1
-                    if count is not None and added >= count:
-                        break
-
-            if count is not None and added >= count:
-                break
-            month_index += 1
-            guard += 1
-
-    elif freq == "YEARLY":
-        year_index = 0
-        guard = 0
-        months = bymonth or [master.start.month]
-        doms = bymonthday or [master.start.day]
-
-        while guard < 200:
-            year = master.start.year + year_index * interval
-            if datetime(year, 1, 1, tzinfo=SITE_TZ) >= window_end:
-                break
-
-            for month in months:
-                if month < 1 or month > 12:
-                    continue
-                last_day = calendar.monthrange(year, month)[1]
-                for dom in doms:
-                    if dom < 1 or dom > last_day:
-                        continue
-                    cand = combine_date_with_time(master.start, date(year, month, dom))
-                    if can_add(cand):
-                        starts.append(cand)
-                        added += 1
-                        if count is not None and added >= count:
-                            break
-                if count is not None and added >= count:
-                    break
-
-            if count is not None and added >= count:
-                break
-            year_index += 1
-            guard += 1
-
-    else:
-        starts.append(master.start)
-
-    starts.extend([r for r in master.rdates if master.start <= r < window_end and r.isoformat() not in exset])
-
-    unique: list[datetime] = []
-    seen: set[str] = set()
-    for dt in sorted(starts):
-        key = dt.isoformat()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(dt)
-    return unique
-
-
-def expand_occurrence_starts(master: RawEvent, window_end: datetime) -> list[datetime]:
-    starts = expand_starts_with_dateutil(master, window_end)
-    if starts:
-        return starts
-    return expand_starts_fallback(master, window_end)
+    # Lightweight fallback for environments without python-dateutil.
+    starts = [master.start] + master.rdates
+    return sorted({dt for dt in starts if dt < window_end and dt not in set(master.exdates)})
 
 
 def expand_events(events: list[RawEvent]) -> list[Event]:
@@ -545,7 +382,7 @@ def expand_events(events: list[RawEvent]) -> list[Event]:
 
     expanded: list[Event] = []
 
-    def emit(source: RawEvent, start: datetime, end: datetime | None, all_day: bool) -> None:
+    def emit(source: RawEvent, start: datetime, end: datetime | None, all_day: bool, description: str) -> None:
         final_end = end
         if final_end is None:
             final_end = start + occurrence_duration(source)
@@ -553,22 +390,22 @@ def expand_events(events: list[RawEvent]) -> list[Event]:
             expanded.append(
                 Event(
                     summary=source.summary,
+                    description=description,
                     start=start,
                     end=final_end,
                     all_day=all_day,
                     location=source.location,
                     url=source.url,
-                    description=source.description,
                 )
             )
 
     for raw in singles:
-        emit(raw, raw.start, raw.end, raw.all_day)
+        emit(raw, raw.start, raw.end, raw.all_day, raw.description)
 
     for series in masters.values():
         for master in series:
             duration = occurrence_duration(master)
-            starts = expand_occurrence_starts(master, window_end)
+            starts = expand_starts(master, window_end)
 
             for start in starts:
                 if start < master.start:
@@ -583,6 +420,7 @@ def expand_events(events: list[RawEvent]) -> list[Event]:
                         override.start,
                         override.end or (override.start + duration),
                         override.all_day,
+                        override.description or master.description,
                     )
                 else:
                     emit(
@@ -590,6 +428,7 @@ def expand_events(events: list[RawEvent]) -> list[Event]:
                         start,
                         start + duration if master.end is not None or master.all_day else None,
                         master.all_day,
+                        master.description,
                     )
 
     expanded.sort(key=lambda e: e.start)
@@ -600,12 +439,12 @@ def to_json(events: list[Event]) -> list[dict]:
     return [
         {
             "summary": e.summary,
+            "description": e.description,
             "start": e.start.isoformat(),
             "end": e.end.isoformat() if e.end else None,
             "all_day": e.all_day,
             "location": e.location,
             "url": e.url,
-            "description": e.description,
         }
         for e in events
     ]
@@ -628,6 +467,28 @@ def widget_js() -> str:
       '"': "&quot;",
       "'": "&#39;"
     }[ch]));
+
+  function fmtDateKey(value) {
+    const d = new Date(value);
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: SITE_TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(d);
+    const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+    return `${map.year}-${map.month}-${map.day}`;
+  }
+
+  function formatDayHeading(value) {
+    const d = new Date(value);
+    return new Intl.DateTimeFormat("en-GB", {
+      weekday: "long",
+      day: "2-digit",
+      month: "long",
+      timeZone: SITE_TZ
+    }).format(d);
+  }
 
   function formatDate(value) {
     const d = new Date(value);
@@ -657,39 +518,82 @@ def widget_js() -> str:
     return `${formatTime(event.start)} - ${formatTime(event.end)}`;
   }
 
-  function linkifyText(text) {
-    const urlRegex = /(https?:\/\/[^\s<]+)/g;
-    return esc(text).replace(urlRegex, (url) => `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>`);
+  function normalizeText(value) {
+    return String(value || "").replace(/\r\n?/g, "\n");
   }
 
-  function descriptionToHtml(description) {
-    if (!description) return "";
-    const normalized = String(description).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
-    if (!normalized) return "";
-    const paragraphs = normalized.split(/\n{2,}/);
-    return paragraphs
-      .map((para) => {
-        const lines = para.split("\n").map((line) => linkifyText(line));
-        return `<p>${lines.join("<br>")}</p>`;
+  function linkifyEscapedText(text) {
+    const urlRe = /(https?:\/\/[^\s<]+[^<.,:;"')\]\s])/g;
+    return text.replace(urlRe, (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);
+  }
+
+  function renderDescription(value) {
+    const raw = normalizeText(value).trim();
+    if (!raw) {
+      return `<p class="calendar-widget__description-empty">No description provided.</p>`;
+    }
+
+    return raw
+      .split(/\n{2,}/)
+      .map((paragraph) => {
+        const escaped = esc(paragraph).replace(/\n/g, "<br>");
+        return `<p>${linkifyEscapedText(escaped)}</p>`;
       })
       .join("");
   }
 
-  function groupByDay(events) {
+  function renderSummary(event) {
+    const title = event.summary || "Untitled event";
+    const location = event.location ? `<div class="calendar-widget__location">${esc(event.location)}</div>` : "";
+    const hasDescription = normalizeText(event.description).trim().length > 0;
+
+    return `
+      <details class="calendar-widget__item" ${hasDescription ? "" : "open"}>
+        <summary class="calendar-widget__summary">
+          <div class="calendar-widget__meta">
+            <span class="calendar-widget__date">${esc(formatDate(event.start))}</span>
+            <span class="calendar-widget__time">${esc(formatRange(event))}</span>
+          </div>
+          <div class="calendar-widget__body">
+            <div class="calendar-widget__title-row">
+              <div class="calendar-widget__name">${esc(title)}</div>
+              <span class="calendar-widget__chevron" aria-hidden="true">\u25b8</span>
+            </div>
+            ${location}
+          </div>
+        </summary>
+        <div class="calendar-widget__description">
+          ${renderDescription(event.description)}
+        </div>
+      </details>
+    `;
+  }
+
+  function renderGroups(events) {
     const groups = [];
-    let currentKey = null;
-    let currentGroup = null;
+    let current = null;
 
     for (const event of events) {
-      const key = event.start ? event.start.slice(0, 10) : "unknown";
-      if (key !== currentKey) {
-        currentKey = key;
-        currentGroup = { key, events: [] };
-        groups.push(currentGroup);
+      const key = fmtDateKey(event.start);
+      if (!current || current.key !== key) {
+        current = {
+          key,
+          label: formatDayHeading(event.start),
+          items: []
+        };
+        groups.push(current);
       }
-      currentGroup.events.push(event);
+      current.items.push(event);
     }
-    return groups;
+
+    return groups.map((group) => `
+      <section class="calendar-widget__day-group">
+        <h4 class="calendar-widget__day-heading">${esc(group.label)}</h4>
+        <div class="calendar-widget__day-items">
+          ${group.items.map(renderSummary).join("")}
+        </div>
+      </section>
+    `).join("");
   }
 
   function render(target, events) {
@@ -714,56 +618,7 @@ def widget_js() -> str:
       return;
     }
 
-    const groups = groupByDay(events);
-
-    listEl.innerHTML = groups.map((group) => {
-      const dayDate = new Date(group.events[0].start);
-      const dayLabel = new Intl.DateTimeFormat("en-GB", {
-        weekday: "long",
-        day: "2-digit",
-        month: "short",
-        year: "numeric",
-        timeZone: SITE_TZ
-      }).format(dayDate);
-
-      const items = group.events.map((event, idx) => {
-        const dateLabel = event.start ? formatDate(event.start) : "";
-        const timeLabel = formatRange(event);
-        const title = event.summary || "Untitled event";
-        const location = event.location ? `<div class="calendar-widget__location">${esc(event.location)}</div>` : "";
-        const descriptionHtml = descriptionToHtml(event.description || "");
-        const descriptionBlock = descriptionHtml
-          ? `<div class="calendar-widget__description">${descriptionHtml}</div>`
-          : `<div class="calendar-widget__description calendar-widget__description--empty"></div>`;
-        const descId = `calendar-desc-${group.key.replace(/[^a-zA-Z0-9_-]/g, "")}-${idx}`;
-
-        return `
-          <article class="calendar-widget__item">
-            <div class="calendar-widget__meta">
-              <span class="calendar-widget__date">${esc(dateLabel)}</span>
-              <span class="calendar-widget__time">${esc(timeLabel)}</span>
-            </div>
-            <details class="calendar-widget__details">
-              <summary class="calendar-widget__summary" aria-controls="${descId}">
-                <span class="calendar-widget__summary-title">${esc(title)}</span>
-                <span class="calendar-widget__chevron" aria-hidden="true">&gt;</span>
-              </summary>
-              ${location}
-              <div id="${descId}">
-                ${descriptionBlock}
-              </div>
-            </details>
-          </article>
-        `;
-      }).join("");
-
-      return `
-        <section class="calendar-widget__day-group">
-          <div class="calendar-widget__day-heading">${esc(dayLabel)}</div>
-          ${items}
-        </section>
-      `;
-    }).join("");
+    listEl.innerHTML = renderGroups(events);
   }
 
   function ensureStyles() {
@@ -771,7 +626,7 @@ def widget_js() -> str:
     const style = document.createElement("style");
     style.id = "calendar-widget-styles";
     style.textContent = `
-      @import url('https://fonts.googleapis.com/css2?family=Quattrocento:wght@400;700&family=Quattrocento+Sans:wght@400;700&display=swap');
+      @import url("https://fonts.googleapis.com/css2?family=Quattrocento:wght@400;700&family=Quattrocento+Sans:wght@400;700&display=swap");
 
       .calendar-widget {
         --ink: #111;
@@ -782,6 +637,7 @@ def widget_js() -> str:
         margin: 0 auto;
         color: var(--ink);
       }
+
       .calendar-widget__head {
         display: flex;
         justify-content: space-between;
@@ -789,140 +645,181 @@ def widget_js() -> str:
         gap: 16px;
         margin-bottom: 14px;
       }
+
+      .calendar-widget__kicker,
+      .calendar-widget__title,
+      .calendar-widget__date,
+      .calendar-widget__time,
+      .calendar-widget__day-heading {
+        font-family: "Quattrocento", Georgia, serif;
+      }
+
       .calendar-widget__kicker {
         text-transform: uppercase;
         letter-spacing: 0.18em;
         font-size: 0.72rem;
         color: var(--muted);
         margin-bottom: 6px;
-        font-family: "Quattrocento Sans", system-ui, sans-serif;
       }
+
       .calendar-widget__title {
         margin: 0;
         font-size: 1.5rem;
         line-height: 1.15;
-        font-weight: 400;
-        font-family: "Quattrocento", Georgia, serif;
+        font-weight: 700;
       }
+
       .calendar-widget__list {
-        max-height: 420px;
-        overflow-y: auto;
         border-top: 1px solid var(--line);
         border-bottom: 1px solid var(--line);
       }
+
       .calendar-widget__day-group + .calendar-widget__day-group {
-        border-top: 1px solid var(--line);
+        margin-top: 1.1rem;
       }
+
       .calendar-widget__day-heading {
-        padding: 0.9rem 0 0.55rem;
-        font-family: "Quattrocento", Georgia, serif;
-        font-size: 0.92rem;
+        margin: 0 0 0.7rem 0;
+        font-size: 0.95rem;
+        font-weight: 700;
         letter-spacing: 0.08em;
         text-transform: uppercase;
         color: var(--muted);
       }
+
+      .calendar-widget__day-items {
+        border-top: 1px solid var(--line);
+      }
+
       .calendar-widget__item {
+        border-bottom: 1px solid var(--line);
+        margin: 0;
+      }
+
+      .calendar-widget__item:hover {
+        background: var(--soft);
+      }
+
+      .calendar-widget__summary {
         display: grid;
         grid-template-columns: 150px 1fr;
         gap: 16px;
         padding: 16px 0;
-        border-top: 1px solid var(--line);
+        list-style: none;
+        cursor: pointer;
       }
-      .calendar-widget__item:first-of-type {
-        border-top: 0;
+
+      .calendar-widget__summary::-webkit-details-marker {
+        display: none;
       }
+
       .calendar-widget__meta {
-        font-family: "Quattrocento", Georgia, serif;
-        font-size: 0.98rem;
+        font-size: 0.92rem;
         line-height: 1.45;
         color: var(--muted);
       }
+
       .calendar-widget__date {
         display: block;
         font-weight: 700;
         color: var(--ink);
         margin-bottom: 2px;
       }
+
       .calendar-widget__time {
         display: block;
       }
-      .calendar-widget__details {
-        margin: 0;
+
+      .calendar-widget__body {
+        min-width: 0;
+        font-family: "Quattrocento Sans", Arial, sans-serif;
       }
-      .calendar-widget__summary {
-        list-style: none;
+
+      .calendar-widget__title-row {
         display: flex;
-        align-items: flex-start;
+        align-items: start;
         justify-content: space-between;
-        gap: 0.75rem;
-        cursor: pointer;
-        font-family: "Quattrocento Sans", system-ui, sans-serif;
+        gap: 12px;
+      }
+
+      .calendar-widget__name {
         font-size: 1.06rem;
         line-height: 1.45;
-        font-weight: 400;
+        font-weight: 700;
         letter-spacing: 0.01em;
-        user-select: none;
       }
-      .calendar-widget__summary::-webkit-details-marker {
-        display: none;
+
+      .calendar-widget__location {
+        margin-top: 0.25rem;
+        color: var(--muted);
+        font-size: 0.92rem;
       }
-      .calendar-widget__summary-title {
-        display: inline-block;
-      }
+
       .calendar-widget__chevron {
         flex: 0 0 auto;
-        transition: transform 180ms ease;
+        font-size: 1rem;
+        line-height: 1;
         color: var(--muted);
-        transform: translateY(0.1em);
-      }
-      .calendar-widget__details[open] .calendar-widget__chevron {
-        transform: rotate(90deg) translateX(0.05em);
-      }
-      .calendar-widget__location {
+        transition: transform 160ms ease;
+        transform-origin: 50% 50%;
         margin-top: 0.2rem;
-        color: var(--muted);
-        font-family: "Quattrocento Sans", system-ui, sans-serif;
-        font-size: 0.93rem;
       }
+
+      .calendar-widget__item[open] .calendar-widget__chevron {
+        transform: rotate(90deg);
+      }
+
       .calendar-widget__description {
-        margin-top: 0.75rem;
-        font-family: "Quattrocento Sans", system-ui, sans-serif;
-        font-size: 0.96rem;
-        line-height: 1.58;
+        padding: 0 0 16px calc(150px + 16px);
+        font-family: "Quattrocento Sans", Arial, sans-serif;
         color: var(--ink);
+        font-size: 0.95rem;
+        line-height: 1.6;
       }
+
       .calendar-widget__description p {
-        margin: 0 0 0.8rem;
+        margin: 0 0 0.75rem 0;
       }
+
       .calendar-widget__description p:last-child {
         margin-bottom: 0;
       }
+
       .calendar-widget__description a {
         color: inherit;
         text-decoration: underline;
         text-underline-offset: 0.15em;
       }
-      .calendar-widget__summary:hover .calendar-widget__summary-title {
-        text-decoration: underline;
-        text-underline-offset: 0.16em;
+
+      .calendar-widget__description-empty {
+        color: var(--muted);
+        font-style: italic;
       }
+
       .calendar-widget__empty,
       .calendar-widget__error {
         padding: 16px 0;
         color: var(--muted);
-        font-family: "Quattrocento Sans", system-ui, sans-serif;
         font-size: 0.95rem;
         line-height: 1.5;
+        font-family: "Quattrocento Sans", Arial, sans-serif;
       }
+
       @media (max-width: 640px) {
         .calendar-widget__head {
           flex-direction: column;
           align-items: start;
         }
-        .calendar-widget__item {
+
+        .calendar-widget__summary {
           grid-template-columns: 1fr;
           gap: 6px;
         }
+
+        .calendar-widget__description {
+          padding-left: 0;
+        }
+
         .calendar-widget__title {
           font-size: 1.3rem;
         }
