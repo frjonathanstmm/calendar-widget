@@ -26,11 +26,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip python-dateutil
+
       - name: Build site
         env:
           ICS_URL: https://calendar.google.com/calendar/ical/c_4a5a1fc5afb51323ac2d430ac7566576eb3385682877769438f6eee2a1037f02%40group.calendar.google.com/public/basic.ics
           SITE_TIME_ZONE: Europe/London
           EVENT_LIMIT: "20"
+          EVENT_WINDOW_DAYS: "365"
         run: python build.py
 
       - name: Upload Pages artifact
