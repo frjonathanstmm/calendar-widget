@@ -790,7 +790,8 @@ def widget_js() -> str:
       .calendar-widget {
         --ink: #111;
         --muted: rgba(17, 17, 17, 0.68);
-        --line: rgba(17, 17, 17, 0.14);
+        --day-line: rgba(17, 17, 17, 0.28);
+        --event-line: rgba(17, 17, 17, 0.10);
         --soft: rgba(17, 17, 17, 0.04);
         max-width: 760px;
         margin: 0 auto;
@@ -822,16 +823,18 @@ def widget_js() -> str:
       .calendar-widget__list {
         max-height: 420px;
         overflow-y: auto;
-        border-top: 1px solid var(--line);
-        border-bottom: 1px solid var(--line);
+        border-top: 1px solid var(--day-line);
+        border-bottom: 1px solid var(--day-line);
       }
       .calendar-widget__day-group + .calendar-widget__day-group {
-        border-top: 1px solid var(--line);
+        border-top: 2px solid var(--day-line);
+        padding-top: 0.95rem;
+        margin-top: 0.2rem;
       }
       .calendar-widget__day-heading {
-        padding: 0.95rem 0 0.6rem;
+        padding: 0 0 0.6rem;
         font-family: "Quattrocento", "Lora", serif;
-        font-size: 0.98rem;
+        font-size: 1.08rem;
         font-weight: 700;
         letter-spacing: 0.06em;
         text-transform: uppercase;
@@ -842,7 +845,7 @@ def widget_js() -> str:
         grid-template-columns: 150px 1fr;
         gap: 16px;
         padding: 16px 0;
-        border-top: 1px solid var(--line);
+        border-top: 1px solid var(--event-line);
       }
       .calendar-widget__item:first-of-type {
         border-top: 0;
