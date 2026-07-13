@@ -746,7 +746,7 @@ def widget_js() -> str:
             <details class="calendar-widget__details">
               <summary class="calendar-widget__summary" aria-controls="${descId}">
                 <span class="calendar-widget__summary-title">${esc(title)}</span>
-                <span class="calendar-widget__chevron" aria-hidden="true">&gt;</span>
+                <span class="calendar-widget__chevron" aria-hidden="true">▸</span>
               </summary>
               ${location}
               <div id="${descId}">
@@ -764,6 +764,12 @@ def widget_js() -> str:
         </section>
       `;
     }).join("");
+
+    // Force all disclosure panels closed on load, even if the browser tries
+    // to restore a previously open state.
+    root.querySelectorAll(".calendar-widget__details").forEach((details) => {
+      details.open = false;
+    });
   }
 
   function ensureStyles() {
