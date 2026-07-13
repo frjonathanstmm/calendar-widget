@@ -821,11 +821,11 @@ def widget_js() -> str:
         border-top: 1px solid var(--line);
       }
       .calendar-widget__day-heading {
-        padding: 0.9rem 0 0.55rem;
+        padding: 0.95rem 0 0.6rem;
         font-family: "Quattrocento", "Lora", serif;
-        font-size: 0.92rem;
+        font-size: 0.98rem;
         font-weight: 700;
-        letter-spacing: 0.08em;
+        letter-spacing: 0.06em;
         text-transform: uppercase;
         color: var(--ink);
       }
@@ -841,7 +841,7 @@ def widget_js() -> str:
       }
       .calendar-widget__meta {
         font-family: "Quattrocento", "Lora", serif;
-        font-size: 0.98rem;
+        font-size: 0.94rem;
         line-height: 1.45;
         color: var(--muted);
       }
@@ -853,6 +853,7 @@ def widget_js() -> str:
       }
       .calendar-widget__time {
         display: block;
+        font-weight: 400;
       }
       .calendar-widget__details {
         margin: 0;
