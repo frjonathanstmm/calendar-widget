@@ -824,9 +824,10 @@ def widget_js() -> str:
         padding: 0.9rem 0 0.55rem;
         font-family: "Quattrocento", "Lora", serif;
         font-size: 0.92rem;
+        font-weight: 700;
         letter-spacing: 0.08em;
         text-transform: uppercase;
-        color: var(--muted);
+        color: var(--ink);
       }
       .calendar-widget__item {
         display: grid;
@@ -846,7 +847,7 @@ def widget_js() -> str:
       }
       .calendar-widget__date {
         display: block;
-        font-weight: 700;
+        font-weight: 400;
         color: var(--ink);
         margin-bottom: 2px;
       }
@@ -858,10 +859,10 @@ def widget_js() -> str:
       }
       .calendar-widget__summary {
         list-style: none;
-        display: flex;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 0.18rem;
+        display: inline-flex;
+        flex-direction: row;
+        align-items: center;
+        gap: 0.35rem;
         cursor: pointer;
         font-family: "Quattrocento Sans", "Lato", sans-serif;
         font-size: 1.06rem;
@@ -874,7 +875,7 @@ def widget_js() -> str:
         display: none;
       }
       .calendar-widget__summary-title {
-        display: inline-block;
+        display: inline;
       }
       .calendar-widget__chevron {
         flex: 0 0 auto;
