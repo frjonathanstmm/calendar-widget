@@ -859,9 +859,9 @@ def widget_js() -> str:
       .calendar-widget__summary {
         list-style: none;
         display: flex;
+        flex-direction: column;
         align-items: flex-start;
-        justify-content: space-between;
-        gap: 0.75rem;
+        gap: 0.18rem;
         cursor: pointer;
         font-family: "Quattrocento Sans", "Lato", sans-serif;
         font-size: 1.06rem;
@@ -880,10 +880,10 @@ def widget_js() -> str:
         flex: 0 0 auto;
         transition: transform 180ms ease;
         color: var(--muted);
-        transform: translateY(0.1em);
+        transform: translateY(0);
       }
       .calendar-widget__details[open] .calendar-widget__chevron {
-        transform: rotate(90deg) translateX(0.05em);
+        transform: rotate(90deg) translateX(0);
       }
       .calendar-widget__location {
         margin-top: 0.2rem;
