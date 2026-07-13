@@ -640,6 +640,20 @@ def widget_js() -> str:
     }).format(d);
   }
 
+  function formatDayHeading(value) {
+    const d = new Date(value);
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+      timeZone: SITE_TZ
+    }).formatToParts(d);
+
+    const get = (type) => (parts.find((part) => part.type === type) || {}).value || "";
+    return `${get("weekday")} ${get("day")} ${get("month")} ${get("year")}`.trim().toUpperCase();
+  }
+
   function formatTime(value) {
     const d = new Date(value);
     return new Intl.DateTimeFormat("en-GB", {
@@ -718,13 +732,7 @@ def widget_js() -> str:
 
     listEl.innerHTML = groups.map((group) => {
       const dayDate = new Date(group.events[0].start);
-      const dayLabel = new Intl.DateTimeFormat("en-GB", {
-        weekday: "long",
-        day: "2-digit",
-        month: "short",
-        year: "numeric",
-        timeZone: SITE_TZ
-      }).format(dayDate);
+      const dayLabel = formatDayHeading(dayDate);
 
       const items = group.events.map((event, idx) => {
         const dateLabel = event.start ? formatDate(event.start) : "";
