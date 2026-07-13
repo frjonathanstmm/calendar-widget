@@ -4,13 +4,10 @@ import json
 import os
 import re
 import urllib.request
-from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
-from dateutil.rrule import rruleset, rrulestr
 
 ICS_URL = os.environ.get(
     "ICS_URL",
@@ -18,9 +15,7 @@ ICS_URL = os.environ.get(
 )
 SITE_TZ = ZoneInfo(os.environ.get("SITE_TIME_ZONE", "Europe/London"))
 OUTDIR = Path("dist")
-EVENT_LIMIT = int(os.environ.get("EVENT_LIMIT", "20"))
-EVENT_WINDOW_DAYS = int(os.environ.get("EVENT_WINDOW_DAYS", "365"))
-LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "1"))
+WINDOW_DAYS = int(os.environ.get("EVENT_WINDOW_DAYS", "14"))
 
 
 @dataclass
@@ -31,11 +26,6 @@ class Event:
     all_day: bool = False
     location: str = ""
     url: str = ""
-    uid: str = ""
-    rrule: str = ""
-    exdates: list[datetime] = field(default_factory=list)
-    recurrence_id: datetime | None = None
-    status: str = ""
 
 
 def fetch_ics(url: str) -> str:
@@ -76,16 +66,6 @@ def parse_line(line: str):
     return name, params, value
 
 
-def unescape_ics_text(value: str) -> str:
-    return (
-        value.replace("\\n", "\n")
-        .replace("\\N", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\\\", "\\")
-    )
-
-
 def parse_ics_datetime(value: str, params: dict[str, str]) -> tuple[datetime, bool]:
     if params.get("VALUE", "").upper() == "DATE" or re.fullmatch(r"\d{8}", value):
         d = datetime.strptime(value[:8], "%Y%m%d").date()
@@ -115,7 +95,7 @@ def parse_events(ics_text: str) -> list[Event]:
 
     for line in lines:
         if line == "BEGIN:VEVENT":
-            current = {"exdates": []}
+            current = {}
             continue
         if line == "END:VEVENT":
             if current is not None:
@@ -128,26 +108,12 @@ def parse_events(ics_text: str) -> list[Event]:
         if not parsed:
             continue
         name, params, value = parsed
-
         if name == "SUMMARY":
-            current["summary"] = unescape_ics_text(value)
+            current["summary"] = value
         elif name == "LOCATION":
-            current["location"] = unescape_ics_text(value)
+            current["location"] = value
         elif name == "URL":
             current["url"] = value
-        elif name == "UID":
-            current["uid"] = value
-        elif name == "RRULE":
-            current["rrule"] = value
-        elif name == "EXDATE":
-            for chunk in value.split(","):
-                ex_dt, _ = parse_ics_datetime(chunk, params)
-                current.setdefault("exdates", []).append(ex_dt)
-        elif name == "RECURRENCE-ID":
-            rec_dt, _ = parse_ics_datetime(value, params)
-            current["recurrence_id"] = rec_dt
-        elif name == "STATUS":
-            current["status"] = value
         elif name == "DTSTART":
             start_dt, all_day = parse_ics_datetime(value, params)
             current["start"] = start_dt
@@ -168,106 +134,23 @@ def parse_events(ics_text: str) -> list[Event]:
                 all_day=bool(e.get("all_day", False)),
                 location=str(e.get("location", "")),
                 url=str(e.get("url", "")),
-                uid=str(e.get("uid", "")),
-                rrule=str(e.get("rrule", "")),
-                exdates=list(e.get("exdates", [])),
-                recurrence_id=e.get("recurrence_id"),
-                status=str(e.get("status", "")),
             )
         )
     return out
 
 
-def event_end(event: Event) -> datetime:
-    if event.end is not None:
-        return event.end
-    if event.all_day:
-        return event.start + timedelta(days=1)
-    return event.start
-
-
-def series_duration(event: Event) -> timedelta:
-    if event.end is not None:
-        return event.end - event.start
-    if event.all_day:
-        return timedelta(days=1)
-    return timedelta(0)
-
-
-def build_exdate_set(exdates: list[datetime]) -> set[datetime]:
-    return {d.replace(microsecond=0) for d in exdates}
-
-
-def expand_events(events: list[Event]) -> list[Event]:
+def filter_and_sort(events: list[Event]) -> list[Event]:
     now = datetime.now(tz=SITE_TZ)
-    window_start = now - timedelta(days=LOOKBACK_DAYS)
-    window_end = now + timedelta(days=EVENT_WINDOW_DAYS)
+    cutoff = now + timedelta(days=WINDOW_DAYS)
 
-    singles: list[Event] = []
-    masters: list[Event] = []
-    overrides_by_uid: dict[str, list[Event]] = defaultdict(list)
-
+    upcoming = []
     for event in events:
-        if event.status.upper() == "CANCELLED":
-            continue
-        if event.recurrence_id is not None:
-            overrides_by_uid[event.uid].append(event)
-        elif event.rrule:
-            masters.append(event)
-        else:
-            if event_end(event) >= now:
-                singles.append(event)
+        end = event.end or (event.start + timedelta(days=1 if event.all_day else 0))
+        if end >= now and event.start < cutoff:
+            upcoming.append(event)
 
-    for master in masters:
-        if not master.start:
-            continue
-
-        duration = series_duration(master)
-        exdates = build_exdate_set(master.exdates)
-        override_starts = {
-            o.recurrence_id.replace(microsecond=0)
-            for o in overrides_by_uid.get(master.uid, [])
-            if o.recurrence_id is not None and o.status.upper() != "CANCELLED"
-        }
-        exdates.update(override_starts)
-
-        try:
-            rule = rrulestr(f"RRULE:{master.rrule}", dtstart=master.start)
-            schedule = rruleset()
-            schedule.rrule(rule)
-            for ex in exdates:
-                schedule.exdate(ex)
-            occurrences = schedule.between(window_start, window_end, inc=True)
-        except Exception:
-            occurrences = [master.start]
-
-        for occ_start in occurrences:
-            occ_start = occ_start.replace(microsecond=0)
-            if occ_start in exdates:
-                continue
-            occ_end = occ_start + duration if duration else None
-            if occ_end is not None and occ_end < now:
-                continue
-            singles.append(
-                Event(
-                    summary=master.summary,
-                    start=occ_start,
-                    end=occ_end,
-                    all_day=master.all_day,
-                    location=master.location,
-                    url=master.url,
-                    uid=master.uid,
-                )
-            )
-
-        for override in overrides_by_uid.get(master.uid, []):
-            if override.status.upper() == "CANCELLED":
-                continue
-            singles.append(override)
-
-    singles = [e for e in singles if event_end(e) >= now]
-    singles.sort(key=lambda e: e.start)
-    return singles[:EVENT_LIMIT]
+    upcoming.sort(key=lambda e: e.start)
+    return upcoming
 
 
 def to_json(events: list[Event]) -> list[dict]:
@@ -287,7 +170,6 @@ def to_json(events: list[Event]) -> list[dict]:
 def widget_js() -> str:
     return r'''(function () {
   const DEFAULT_TARGET = "#calendar-widget";
-  const DEFAULT_LIMIT = 20;
   const SITE_TZ = "Europe/London";
 
   const currentScript = document.currentScript;
@@ -356,14 +238,14 @@ def widget_js() -> str:
       return;
     }
 
-    listEl.innerHTML = events.slice(0, DEFAULT_LIMIT).map((event) => {
+    listEl.innerHTML = events.map((event) => {
       const dateLabel = event.start ? formatDate(event.start) : "";
       const timeLabel = formatRange(event);
       const title = event.summary || "Untitled event";
+      const location = event.location ? `<div class="calendar-widget__location">${esc(event.location)}</div>` : "";
       const titleHtml = event.url
         ? `<a href="${esc(event.url)}" target="_blank" rel="noopener noreferrer">${esc(title)}</a>`
         : esc(title);
-      const location = event.location ? `<div class="calendar-widget__location">${esc(event.location)}</div>` : "";
 
       return `
         <article class="calendar-widget__item">
@@ -511,26 +393,25 @@ def widget_js() -> str:
 })();
 '''
 
-
 def main() -> None:
     ics = fetch_ics(ICS_URL)
-    events = expand_events(parse_events(ics))
+    events = filter_and_sort(parse_events(ics))
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
     (OUTDIR / "events.json").write_text(json.dumps({"events": to_json(events)}, indent=2), encoding="utf-8")
     (OUTDIR / "widget.js").write_text(widget_js(), encoding="utf-8")
     (OUTDIR / "index.html").write_text(
         """<!doctype html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Calendar Widget Preview</title>
   <style>body{margin:0;padding:40px 20px;background:#fff;color:#111;}</style>
 </head>
 <body>
-  <div id=\"calendar-widget\"></div>
-  <script src=\"./widget.js\" defer></script>
+  <div id="calendar-widget"></div>
+  <script src="./widget.js" defer></script>
 </body>
 </html>
 """,
