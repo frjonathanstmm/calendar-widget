@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
   schedule:
-    # Every 1m
+    # Every one minute
     - cron: '* * * * *'
 
 permissions:
