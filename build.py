@@ -808,7 +808,7 @@ def widget_js() -> str:
       .calendar-widget__list {
         max-height: 420px;
         overflow-y: auto;
-        border-top: 1px solid var(--day-line);
+        border-top: none;
         border-bottom: 1px solid var(--day-line);
       }
       .calendar-widget__day-group + .calendar-widget__day-group {
