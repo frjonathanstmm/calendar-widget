@@ -22,7 +22,7 @@ ICS_URL = os.environ.get(
 )
 SITE_TZ = ZoneInfo(os.environ.get("SITE_TIME_ZONE", "Europe/London"))
 OUTDIR = Path("dist")
-WINDOW_DAYS = int(os.environ.get("EVENT_WINDOW_DAYS", "14"))
+WINDOW_DAYS = int(os.environ.get("EVENT_WINDOW_DAYS", "365"))
 
 WEEKDAY_MAP = {
     "MO": 0,
