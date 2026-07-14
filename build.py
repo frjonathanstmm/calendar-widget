@@ -713,7 +713,6 @@ def widget_js() -> str:
     root.classList.add("calendar-widget");
     root.innerHTML = `
   <div class="calendar-widget__head">
-    <h3 class="calendar-widget__title">Upcoming services and events</h3>
   </div>
   <div class="calendar-widget__list" data-calendar-list aria-live="polite"></div>
 `;
@@ -805,13 +804,6 @@ def widget_js() -> str:
         align-items: end;
         gap: 16px;
         margin-bottom: 14px;
-      }
-      .calendar-widget__title {
-        margin: 0;
-        font-size: 1.5rem;
-        line-height: 1.15;
-        font-weight: 400;
-        font-family: "Quattrocento", "Lora", serif;
       }
       .calendar-widget__list {
         max-height: 420px;
@@ -935,9 +927,6 @@ def widget_js() -> str:
         .calendar-widget__item {
           grid-template-columns: 1fr;
           gap: 6px;
-        }
-        .calendar-widget__title {
-          font-size: 1.3rem;
         }
       }
     `;
