@@ -36,7 +36,7 @@ jobs:
         env:
           ICS_URL: https://calendar.google.com/calendar/ical/c_4a5a1fc5afb51323ac2d430ac7566576eb3385682877769438f6eee2a1037f02%40group.calendar.google.com/public/basic.ics
           SITE_TIME_ZONE: Europe/London
-          EVENT_WINDOW_DAYS: "14"
+          EVENT_WINDOW_DAYS: "365"
         run: python build.py
 
       - name: Upload Pages artifact
