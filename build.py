@@ -827,7 +827,7 @@ def widget_js() -> str:
       }
       .calendar-widget__item {
         display: grid;
-        grid-template-columns: 200px 1fr;
+        grid-template-columns: 250px 1fr;
         gap: 16px;
         padding: 16px 0;
         border-top: 1px solid var(--event-line);
