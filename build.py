@@ -819,7 +819,7 @@ def widget_js() -> str:
       .calendar-widget__day-heading {
         padding: 0 0 0.6rem;
         font-family: "Quattrocento", "Lora", serif;
-        font-size: 1.08rem;
+        font-size: 1.3rem;
         font-weight: 700;
         letter-spacing: 0.06em;
         text-transform: uppercase;
@@ -837,7 +837,7 @@ def widget_js() -> str:
       }
       .calendar-widget__meta {
         font-family: "Quattrocento", "Lora", serif;
-        font-size: 0.94rem;
+        font-size: 1.15rem;
         line-height: 1.45;
         color: var(--muted);
       }
@@ -862,7 +862,7 @@ def widget_js() -> str:
         gap: 0.35rem;
         cursor: pointer;
         font-family: "Quattrocento Sans", "Lato", sans-serif;
-        font-size: 1.06rem;
+        font-size: 1.3rem;
         line-height: 1.45;
         font-weight: 400;
         letter-spacing: 0.01em;
@@ -887,12 +887,12 @@ def widget_js() -> str:
         margin-top: 0.2rem;
         color: var(--muted);
         font-family: "Quattrocento Sans", "Lato", sans-serif;
-        font-size: 0.93rem;
+        font-size: 1.15rem;
       }
       .calendar-widget__description {
         margin-top: 0.75rem;
         font-family: "Quattrocento Sans", "Lato", sans-serif;
-        font-size: 0.96rem;
+        font-size: 1.15rem;
         line-height: 1.58;
         color: var(--ink);
       }
@@ -916,7 +916,7 @@ def widget_js() -> str:
         padding: 16px 0;
         color: var(--muted);
         font-family: "Quattrocento", "Lora", serif;
-        font-size: 0.95rem;
+        font-size: 1.15rem;
         line-height: 1.5;
       }
       @media (max-width: 640px) {
