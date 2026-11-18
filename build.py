@@ -918,7 +918,7 @@ def widget_js() -> str:
         font-family: "Quattrocento", "Lora", serif;
         font-size: 1.8rem;
         line-height: 1.5;
-      }
+       }
       @media (max-width: 640px) {
         .calendar-widget__head {
           flex-direction: column;
@@ -927,6 +927,9 @@ def widget_js() -> str:
         .calendar-widget__item {
           grid-template-columns: 1fr;
           gap: 6px;
+        }
+        .calendar-widget__day-heading {
+          font-size: 1.2rem;
         }
       }
     `;
